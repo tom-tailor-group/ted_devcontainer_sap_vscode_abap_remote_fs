@@ -1,5 +1,6 @@
 import { TransportsProvider } from "./views/transports"
 import { FavouritesProvider } from "./views/favourites"
+import { ObjectExplorerProvider } from "./views/objectExplorer"
 import { atcProvider, registerSCIDecorator } from "./views/abaptestcockpit"
 import { FsProvider } from "./fs/FsProvider"
 import { workspace, ExtensionContext, languages, commands } from "vscode"
@@ -214,6 +215,26 @@ export async function activate(ctx: ExtensionContext): Promise<AbapFsApi> {
   const fav = FavouritesProvider.get()
   fav.storagePath = context.globalStoragePath
   const objectPropertyProvider = ObjectPropertyProvider.get()
+  const objectExplorer = ObjectExplorerProvider.get()
+  sub.push(window.registerTreeDataProvider("abapfs.objectExplorer", objectExplorer))
+  sub.push(
+    commands.registerCommand("abapfs.refreshObjectExplorer", () => objectExplorer.refresh())
+  )
+  sub.push(
+    commands.registerCommand("abapfs.filterObjectExplorer", () => objectExplorer.promptFilter())
+  )
+  sub.push(
+    commands.registerCommand("abapfs.clearFilterObjectExplorer", () =>
+      objectExplorer.clearFilter()
+    )
+  )
+  sub.push(
+    commands.registerCommand("abapfs.downloadFromExplorer", (node: any) => {
+      if (node?.adtUri) {
+        commands.executeCommand("abapSync.sync", node.adtUri)
+      }
+    })
+  )
   sub.push(window.registerTreeDataProvider("abapfs.favorites", fav))
   sub.push(window.registerTreeDataProvider("abapfs.transports", TransportsProvider.get()))
   sub.push(window.registerTreeDataProvider("abapfs.abapgit", abapGitProvider))

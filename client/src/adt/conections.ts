@@ -175,6 +175,9 @@ export async function disconnect() {
 }
 
 export const rootIsConnected = (connId: string) =>
+  roots.has(connId) ||
   !!workspace.workspaceFolders?.find(
     f => f.uri.scheme === ADTSCHEME && f.uri.authority === connId?.toLowerCase()
   )
+
+export const getConnectedRoots = (): Map<string, Root> => new Map(roots)

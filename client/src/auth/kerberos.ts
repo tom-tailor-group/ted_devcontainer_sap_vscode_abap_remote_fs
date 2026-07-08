@@ -2,25 +2,31 @@
  * Kerberos / SPNEGO Authentication
  *
  * Uses the OS-native credential stack to authenticate to SAP systems
- * with Kerberos/SPNEGO (e.g. SAP Secure Login Client on Windows).
+ * with Kerberos/SPNEGO.
  *
  * On Windows: invokes PowerShell with .NET HttpWebRequest +
- *   UseDefaultCredentials, which uses Windows SSPI automatically.
+ *   UseDefaultCredentials (Windows SSPI), with SLC certificate fallback.
  *   Zero native modules required — no `kerberos` npm package.
  *
+ * On Linux/macOS: uses `curl --negotiate` with GSSAPI. Requires:
+ *   - krb5-user package (provides kinit/klist)
+ *   - A valid TGT obtained via `kinit username@DOMAIN.COM`
+ *   - curl built with GSSAPI/SPNEGO support (default on Debian/Ubuntu)
+ *
  * Flow:
- *  1. Windows domain user has a Kerberos TGT (domain login or SAP Secure Login Client)
- *  2. PowerShell makes an HTTP request to SAP with UseDefaultCredentials=true
- *  3. .NET/SSPI handles the full SPNEGO Negotiate handshake transparently
- *  4. We capture the session cookies (MYSAPSSO2, SAP_SESSIONID_*) from the response
- *  5. Subsequent ADT requests use those cookies via custom headers
+ *  1. OS-native SPNEGO handshake against SAP ICF (either PowerShell or curl)
+ *  2. We capture the session cookies (MYSAPSSO2, SAP_SESSIONID_*) from the response
+ *  3. Subsequent ADT requests use those cookies via custom headers
  *
  * Prerequisites:
- *  - Windows domain-joined machine with valid Kerberos TGT
  *  - SAP ICF service configured for SPNego authentication
+ *  - Valid Kerberos TGT (domain login / SAP SLC on Windows; kinit on Linux)
  */
 
 import { execFile } from "child_process"
+import { tmpdir } from "os"
+import { join } from "path"
+import { unlinkSync, existsSync, readFileSync } from "fs"
 import { AuthResult, KerberosAuthConfig } from "./types"
 import { PasswordVault, log } from "../lib"
 import { formatKey } from "../config"
@@ -28,17 +34,6 @@ import { buildCookieHeaders, errorMessage, sanitizeCookie, toStringArray } from 
 
 const VAULT_SERVICE = "vscode.abapfs.kerberos"
 
-/** SAP session cookie name patterns that indicate successful authentication. */
-const SAP_AUTH_COOKIE_PATTERNS = [
-  /^MYSAPSSO2$/i,
-  /^SAP_SESSIONID_/i,
-  /^sap-XCSRF/i,
-  /^SAP_CLIENTID/i
-]
-
-function isAuthCookie(name: string): boolean {
-  return SAP_AUTH_COOKIE_PATTERNS.some(p => p.test(name))
-}
 
 /** Store captured session cookies securely. */
 export async function storeKerberosCookies(connId: string, cookies: string[]): Promise<void> {
@@ -344,8 +339,134 @@ function isTrackingCookie(name: string): boolean {
 }
 
 /**
- * Perform Windows SSO authentication against SAP and capture session cookies.
- * Tries Kerberos/NTLM first, then falls back to Windows cert store (SLC).
+ * Parse cookies from a Netscape-format cookie jar file produced by curl --cookie-jar.
+ * Each data line has 7 tab-separated fields; field[0] is the domain/flag, field[5] is
+ * the name, field[6] is the value.
+ */
+function parseCurlCookieJar(content: string): string[] {
+  const cookies: string[] = []
+  for (const line of content.split("\n")) {
+    if (!line || line.startsWith("#")) continue
+    const parts = line.split("\t")
+    if (parts.length < 7) continue
+    const name = parts[5].trim()
+    const value = parts[6].trim()
+    if (name) cookies.push(`${name}=${value}`)
+  }
+  return cookies
+}
+
+/**
+ * Authenticate against SAP on Linux using `curl --negotiate`.
+ *
+ * Requires:
+ *  - krb5-user installed (`kinit` / `klist` available)
+ *  - A valid Kerberos TGT obtained via `kinit username@DOMAIN.COM`
+ *  - curl built with GSSAPI/SPNEGO support (default on Debian/Ubuntu)
+ *
+ * Flow:
+ *  1. curl performs SPNEGO Negotiate handshake using the TGT from the KRB5 ccache
+ *  2. SAP issues session cookies (MYSAPSSO2, SAP_SESSIONID_*) on success
+ *  3. We read the cookie jar file and return the session cookies
+ */
+async function negotiateWithSapLinux(
+  kerberosConfig: KerberosAuthConfig | undefined,
+  sapBaseUrl: string,
+  sapClient: string,
+  skipSsl: boolean
+): Promise<string[]> {
+  if (!/^https?:\/\//i.test(sapBaseUrl)) {
+    throw new Error("Kerberos SSO requires an HTTP(S) URL")
+  }
+
+  const url = `${sapBaseUrl}/sap/bc/adt/discovery?sap-client=${encodeURIComponent(sapClient)}`
+  const cookieJarPath = join(tmpdir(), `abapfs-kerberos-${Date.now()}.txt`)
+  const targetSpn = buildKerberosSpn(kerberosConfig, sapBaseUrl)
+
+  log.debug(
+    `[sso] Starting Linux curl --negotiate SSO for: ${url}${targetSpn ? `, targetSpn=${targetSpn}` : ""}`
+  )
+
+  const args = [
+    "--negotiate",
+    "-u", ":",          // empty credentials — use Kerberos TGT
+    "--cookie-jar", cookieJarPath,
+    "-o", "/dev/null",  // discard response body
+    "-s",               // silent (no progress bar)
+    "-w", "%{http_code}", // only output the status code
+  ]
+
+  if (skipSsl) args.push("-k")
+  if (targetSpn) {
+    // Override the SPNEGO service principal name (curl 7.83+)
+    args.push("--service-name", targetSpn)
+  }
+
+  args.push(url)
+
+  let httpStatus = "0"
+  try {
+    httpStatus = await new Promise<string>((resolve, reject) => {
+      execFile("curl", args, { timeout: 30_000 }, (error, stdout, stderr) => {
+        if (error && error.code !== 0 && !stdout) {
+          log.debug(`[sso] curl error: ${error.message}${stderr ? `\nstderr: ${stderr}` : ""}`)
+          reject(new Error(`curl failed: ${error.message}`))
+          return
+        }
+        if (stderr) log.debug(`[sso] curl stderr: ${stderr.substring(0, 300)}`)
+        resolve(stdout.trim())
+      })
+    })
+  } finally {
+    // cookie jar cleanup happens after we read it below
+  }
+
+  const statusCode = parseInt(httpStatus, 10)
+  log.debug(`[sso] curl --negotiate returned HTTP ${statusCode}`)
+
+  if (statusCode < 200 || statusCode >= 400) {
+    if (existsSync(cookieJarPath)) unlinkSync(cookieJarPath)
+    throw new Error(
+      `Kerberos SSO failed: SAP returned HTTP ${statusCode}.\n` +
+        `Make sure you have a valid TGT (run: kinit <username>@<DOMAIN.COM>) and that ` +
+        `SPNego authentication is enabled on the SAP ICF service (/sap/bc/adt).`
+    )
+  }
+
+  let rawCookies: string[] = []
+  try {
+    if (existsSync(cookieJarPath)) {
+      const content = readFileSync(cookieJarPath, "utf-8")
+      rawCookies = parseCurlCookieJar(content)
+    }
+  } finally {
+    if (existsSync(cookieJarPath)) unlinkSync(cookieJarPath)
+  }
+
+  const allCookies = rawCookies.map(cookie => sanitizeCookie(cookie))
+  const sessionCookies = allCookies.filter(c => !isTrackingCookie(c.split("=")[0]))
+
+  log.debug(
+    `[sso] Cookies: total=${allCookies.length}, session=${sessionCookies.length} (${sessionCookies.map(c => c.split("=")[0]).join(",")})`
+  )
+
+  if (sessionCookies.length === 0) {
+    throw new Error(
+      `Kerberos SSO: SAP returned HTTP ${statusCode} but no session cookies were captured. ` +
+        `Tracking cookies were filtered. Raw cookies: ${allCookies.map(c => c.split("=")[0]).join(", ") || "none"}\n` +
+        `Check that your TGT is valid (klist) and that the SAP system is configured for SPNego.`
+    )
+  }
+
+  log.debug(`[sso] Authenticated via Kerberos/SPNEGO (Linux curl)`)
+  return sessionCookies
+}
+
+/**
+ * Perform SSO authentication against SAP and capture session cookies.
+ *
+ * On Windows: Uses PowerShell SSPI (Kerberos/NTLM + SLC certificate fallback).
+ * On Linux/macOS: Uses `curl --negotiate` with GSSAPI (requires kinit TGT).
  */
 async function negotiateWithSap(
   kerberosConfig: KerberosAuthConfig | undefined,
@@ -353,13 +474,22 @@ async function negotiateWithSap(
   sapClient: string,
   skipSsl: boolean
 ): Promise<string[]> {
-  if (process.platform !== "win32") {
-    throw new Error(
-      "Kerberos/SPNEGO authentication is currently supported on Windows only. " +
-        "Your machine must be domain-joined with a valid Kerberos TGT, or have SAP Secure Login Client running."
-    )
+  if (process.platform === "win32") {
+    return negotiateWithSapWindows(kerberosConfig, sapBaseUrl, sapClient, skipSsl)
   }
+  return negotiateWithSapLinux(kerberosConfig, sapBaseUrl, sapClient, skipSsl)
+}
 
+/**
+ * Perform Windows SSO authentication against SAP and capture session cookies.
+ * Tries Kerberos/NTLM first, then falls back to Windows cert store (SLC).
+ */
+async function negotiateWithSapWindows(
+  kerberosConfig: KerberosAuthConfig | undefined,
+  sapBaseUrl: string,
+  sapClient: string,
+  skipSsl: boolean
+): Promise<string[]> {
   if (!/^https?:\/\//i.test(sapBaseUrl)) {
     throw new Error("Windows SSO requires an HTTP(S) URL")
   }
